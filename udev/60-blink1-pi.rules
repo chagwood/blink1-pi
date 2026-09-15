@@ -1,0 +1,3 @@
+# ThingM blink(1) mk2/mk3 — grant the active desktop user access via logind,
+# with plugdev group access as a fallback for non-desktop sessions.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="27b8", ATTRS{idProduct}=="01ed", TAG+="uaccess", GROUP="plugdev", MODE="0660"
