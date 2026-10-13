@@ -33,6 +33,7 @@ const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_CHILD";
 const SUBAGENT_ASYNC_STARTED_EVENT = "subagent:async-started";
 const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
 const SUBAGENT_PROCESS_TERMINAL_EVENT = "subagent:process-terminal";
+const ASK_USER_BLOCKED_EVENT = "rpiv:ask-user:blocked";
 
 const STAGES: Stage[] = ["idle", "working", "waiting", "error"];
 const MODES: EffectMode[] = ["solid", "blink", "fade", "frontback"];
@@ -206,6 +207,7 @@ export default function blink1Pi(pi: ExtensionAPI) {
 	let config = defaultConfig();
 	let active = false;
 	let waitingDepth = 0;
+	let askUserBlocked = false;
 	let runFailed = false;
 	let shuttingDown = false;
 	let offUntilNextRun = false;
@@ -241,7 +243,7 @@ export default function blink1Pi(pi: ExtensionAPI) {
 		if (shuttingDown) return "off";
 		if (previewStage) return previewStage;
 		if (offUntilNextRun) return "off";
-		if (waitingDepth > 0) return "waiting";
+		if (waitingDepth > 0 || askUserBlocked) return "waiting";
 		if (runFailed) return "error";
 		if (active || activeAsyncSubagentRuns.size > 0) return "working";
 		return "idle";
@@ -379,10 +381,22 @@ export default function blink1Pi(pi: ExtensionAPI) {
 		void refreshLight();
 	}
 
-	const subagentEventUnsubscribes = [
+	// `ask_user_question` renders its questionnaire through ctx.ui.custom(), so the
+	// prompt filter below cannot see it. The package emits an explicit blocked/unblocked
+	// pair around the wait, which is the precise "a human must answer this" signal.
+	function handleAskUserBlocked(payload: unknown): void {
+		if (!payload || typeof payload !== "object") return;
+		const blocked = (payload as { active?: unknown }).active;
+		if (typeof blocked !== "boolean" || blocked === askUserBlocked) return;
+		askUserBlocked = blocked;
+		void refreshLight();
+	}
+
+	const customEventUnsubscribes = [
 		pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, handleAsyncSubagentStarted),
 		pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, handleAsyncSubagentFinished),
 		pi.events.on(SUBAGENT_PROCESS_TERMINAL_EVENT, handleAsyncSubagentFinished),
+		pi.events.on(ASK_USER_BLOCKED_EVENT, handleAskUserBlocked),
 	];
 
 	async function configureStageInteractively(stage: Stage, ctx: ExtensionCommandContext): Promise<void> {
@@ -568,6 +582,7 @@ export default function blink1Pi(pi: ExtensionAPI) {
 		activeAsyncSubagentRuns.clear();
 		active = false;
 		waitingDepth = 0;
+		askUserBlocked = false;
 		runFailed = false;
 		shuttingDown = false;
 		offUntilNextRun = false;
@@ -582,13 +597,22 @@ export default function blink1Pi(pi: ExtensionAPI) {
 		await refreshLight();
 	});
 
-	pi.on("ui_prompt_start", async () => {
+	pi.on("ui_prompt_start", async (event) => {
+		// Pi routes every ctx.ui.custom() call through the prompt lifecycle, but custom is
+		// also the only way to mount persistent, non-blocking UI such as an ambient sidebar.
+		// That overlay never settles, so counting it would pin Waiting for the whole session
+		// and mask Working and Error. Only blocking prompts count here; questionnaires are
+		// covered by ASK_USER_BLOCKED_EVENT instead.
+		if (event.kind === "custom") return;
 		waitingDepth++;
 		await refreshLight();
 	});
 
 	pi.on("ui_prompt_end", async () => {
-		waitingDepth = Math.max(0, waitingDepth - 1);
+		// Pi coalesces nested prompts into one start/end pair, so an end event always means
+		// nothing is outstanding. Clearing instead of decrementing keeps the counter
+		// drift-proof when the matching start was filtered out above.
+		waitingDepth = 0;
 		await refreshLight();
 	});
 
@@ -619,8 +643,9 @@ export default function blink1Pi(pi: ExtensionAPI) {
 		active = false;
 		activeAsyncSubagentRuns.clear();
 		waitingDepth = 0;
+		askUserBlocked = false;
 		previewStage = undefined;
 		await refreshLight(true);
-		for (const unsubscribe of subagentEventUnsubscribes) unsubscribe();
+		for (const unsubscribe of customEventUnsubscribes) unsubscribe();
 	});
 }

@@ -158,7 +158,7 @@ small in-memory state machine and applies the configured visual state to both LE
 |---|---|---|
 | Idle | Session is ready and no parent or asynchronous child is active | Green, solid |
 | Working | The parent agent is active, or one or more asynchronous subagents are active | Yellow, solid |
-| Waiting | Pi has opened an interactive prompt for the user | Blue, solid |
+| Waiting | Pi has opened a **blocking** prompt (`select`, `confirm`, `input`, `editor`), or `ask_user_question` is awaiting an answer | Blue, solid |
 | Error | The **parent** run reached a terminal error, output-length failure, or non-aborted compaction failure | Red, solid |
 | Shutdown | Pi is shutting down | Off |
 
@@ -181,6 +181,33 @@ shutdown
 
 For example, a user prompt takes priority over working or error, and `/blink1-pi off`
 suppresses every ordinary state until the next parent agent run.
+
+### Persistent overlays are not prompts
+
+Pi routes every `ctx.ui.custom()` call through the same prompt lifecycle as `select`,
+`confirm`, `input`, and `editor`. But `custom` is also the only way an extension can mount
+persistent, non-blocking UI — a status rail, an ambient sidebar, a split pane. Such an
+overlay stays open for the whole session, so its `ui_prompt_start` is never followed by a
+`ui_prompt_end` until it closes.
+
+Counting those would pin the light to Waiting for the entire session. Because Waiting
+outranks both Working and Error, that silently masks the two indications you most need.
+`blink1-pi` therefore ignores `ui_prompt_start` when `kind` is `custom`.
+
+The trade-off: an extension dialog that genuinely blocks on the user but renders through
+`ctx.ui.custom()` no longer shows Waiting. `ask_user_question` is covered explicitly, since
+`@juicesharp/rpiv-ask-user-question` emits `rpiv:ask-user:blocked` with `{ active }` around
+the wait and clears it in a `finally`. Other `custom`-based dialogs are not.
+
+A second, wider limitation comes from Pi itself rather than from this filter. Pi emits
+`ui_prompt_start` only for the **outermost** prompt (`uiPromptDepth++ === 0`). While a
+persistent overlay is mounted that depth is already 1, so a later `select`, `confirm`,
+`input`, or `editor` prompt emits no start event at all and no extension can observe it.
+While an ambient sidebar is open, native blocking prompts therefore do not show Waiting
+either, and no client-side filter can recover them because the event never fires.
+
+If native prompts must light up, do not keep a persistent overlay mounted for the whole
+session. For pi-atelier, set `showSidebarOnStartup` to `false` and open the sidebar on demand.
 
 ### Subagents and device ownership
 

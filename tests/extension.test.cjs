@@ -166,6 +166,83 @@ async function main() {
   await emit("agent_settled");
   assert.equal(lastColor(), "00ff00");
 
+  // A persistent ctx.ui.custom() overlay (an ambient sidebar, for example) never
+  // settles, so Pi reports one ui_prompt_start with kind "custom" and no matching end
+  // until it closes. Counting it would pin waiting and mask working and error.
+  await emit("ui_prompt_start", { kind: "custom" });
+  assert.equal(lastColor(), "00ff00", "a persistent custom overlay must not select waiting");
+  await emit("agent_start");
+  assert.equal(lastColor(), "ffff00", "working must stay visible while a custom overlay is open");
+  await emit("message_end", { message: { role: "assistant", stopReason: "error" } });
+  await emit("agent_settled");
+  assert.equal(lastColor(), "ff0000", "error must stay visible while a custom overlay is open");
+  await emit("ui_prompt_end", { kind: "custom" });
+  assert.equal(lastColor(), "ff0000", "closing a custom overlay must not disturb a sticky error");
+
+  // Blocking prompts keep the waiting stage and reveal the underlying state on close.
+  await emit("ui_prompt_start", { kind: "select" });
+  assert.equal(lastColor(), "0000ff", "a blocking select prompt must select waiting");
+  await emit("ui_prompt_end", { kind: "select" });
+  assert.equal(lastColor(), "ff0000", "closing a blocking prompt must reveal the sticky error");
+
+  await emit("agent_start");
+  await emit("message_end", { message: { role: "assistant", stopReason: "stop" } });
+  await emit("agent_settled");
+  assert.equal(lastColor(), "00ff00");
+
+  // ask_user_question renders through ctx.ui.custom(), so the prompt filter above cannot
+  // see it; the package emits an explicit blocked/unblocked pair around the wait instead.
+  pi.events.emit("rpiv:ask-user:blocked", { active: true });
+  await flushCustomEvents();
+  assert.equal(lastColor(), "0000ff", "a questionnaire must select waiting");
+  await emit("agent_start");
+  assert.equal(lastColor(), "0000ff", "waiting must outrank working while a questionnaire is open");
+  pi.events.emit("rpiv:ask-user:blocked", { active: false });
+  await flushCustomEvents();
+  assert.equal(lastColor(), "ffff00", "answering a questionnaire must reveal the running agent");
+
+  const callsBeforeMalformed = calls.length;
+  pi.events.emit("rpiv:ask-user:blocked", { active: false });
+  pi.events.emit("rpiv:ask-user:blocked", {});
+  pi.events.emit("rpiv:ask-user:blocked", null);
+  pi.events.emit("rpiv:ask-user:blocked", { active: "yes" });
+  await flushCustomEvents();
+  assert.equal(
+    calls.length,
+    callsBeforeMalformed,
+    "duplicate or malformed blocked payloads must not touch the device",
+  );
+
+  await emit("message_end", { message: { role: "assistant", stopReason: "stop" } });
+  await emit("agent_settled");
+  assert.equal(lastColor(), "00ff00");
+
+  // A blocking prompt and the questionnaire flag must combine without double-counting.
+  await emit("ui_prompt_start", { kind: "confirm" });
+  assert.equal(lastColor(), "0000ff", "a blocking confirm prompt must select waiting");
+  pi.events.emit("rpiv:ask-user:blocked", { active: true });
+  await flushCustomEvents();
+  assert.equal(lastColor(), "0000ff", "both waiting sources must agree on the waiting stage");
+  pi.events.emit("rpiv:ask-user:blocked", { active: false });
+  await flushCustomEvents();
+  assert.equal(lastColor(), "0000ff", "the blocking prompt must hold waiting on its own");
+  await emit("ui_prompt_end", { kind: "confirm" });
+  assert.equal(lastColor(), "00ff00", "waiting must end once every source is clear");
+
+  // Drift-proofing: an end event clears waiting whatever its kind, so a start that was
+  // filtered out, or swallowed by Pi's outermost-only coalescing, can never pin waiting.
+  await emit("ui_prompt_start", { kind: "input" });
+  assert.equal(lastColor(), "0000ff");
+  await emit("ui_prompt_end", { kind: "custom" });
+  assert.equal(lastColor(), "00ff00", "any end event must clear waiting, whatever its kind");
+
+  // session_start must clear a blocked flag left over from a previous session.
+  pi.events.emit("rpiv:ask-user:blocked", { active: true });
+  await flushCustomEvents();
+  assert.equal(lastColor(), "0000ff");
+  await emit("session_start");
+  assert.equal(lastColor(), "00ff00", "session_start must clear a leftover blocked flag");
+
   // Async subagents use the ordinary working stage, overlap safely, and never
   // promote child failure to the parent error stage.
   calls.length = 0;
@@ -252,6 +329,9 @@ async function main() {
   pi.events.emit("subagent:async-started", { id: "after-shutdown" });
   await flushCustomEvents();
   assert.equal(calls.length, callsAfterShutdown, "shutdown must unsubscribe subagent event listeners");
+  pi.events.emit("rpiv:ask-user:blocked", { active: true });
+  await flushCustomEvents();
+  assert.equal(calls.length, callsAfterShutdown, "shutdown must unsubscribe the questionnaire listener");
   assert.ok(calls.every((call) => call.command === "/mock/blink1-tool"));
   assert.ok(calls.every((call) => call.options.timeout === 3000));
 
